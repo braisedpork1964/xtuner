@@ -120,6 +120,8 @@ class RolloutConfig(BaseModel):
         rollout_timeout (float): Timeout duration in seconds for rollout requests. Defaults to 1200.0.
         session_server_timeout (float): Timeout duration in seconds for SessionServer requests forwarded to rollout
             workers. Defaults to 1200.0.
+        reject_truncated_response (bool): Whether SessionServer rejects assistant turns whose ``output_ids`` lack a
+            trailing eos token, instead of tracing the partial text. Defaults to False.
         context_length (int): Context length for the rollout worker.
         launch_server_method (Literal["ray", "multiprocessing"]): Server launch method. Defaults to "ray".
         system_prompt (Optional[str]): System prompt to guide generation behavior. Defaults to None.
@@ -295,6 +297,13 @@ class RolloutConfig(BaseModel):
             help="Timeout duration (in seconds) for SessionServer requests forwarded to rollout workers.",
         ),
     ] = 1200.0
+    reject_truncated_response: Annotated[
+        bool,
+        Parameter(
+            group=infer_group,
+            help="Reject assistant turns whose output_ids lack a trailing eos instead of tracing the partial text.",
+        ),
+    ] = False
     context_length: Annotated[
         Optional[int],
         Parameter(
@@ -707,6 +716,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                 port=self.session_server_port,
                 request_timeout=self.config.session_server_timeout,
                 enable_return_routed_experts=self.enable_return_routed_experts,
+                reject_truncated_response=self.config.reject_truncated_response,
             )
         )
         self.session_server_url = ray.get(

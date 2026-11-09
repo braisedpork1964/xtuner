@@ -22,6 +22,46 @@ FMT_ANTHROPIC = "anthropic"
 # Fields the SessionServer consumes locally and never forwards upstream.
 _SESSION_SERVER_ONLY_KEYS = {"session_id"}
 
+# Terminal reasons for a turn that legitimately stops without emitting eos:
+# - ``length`` / ``max_tokens``: the caller capped the turn's length (OpenAI / Anthropic naming).
+# - ``parse_error``: lmdeploy rewrites ``stop``/``length`` to this when its completeness check fails, e.g. an
+#   unterminated reasoning block. The turn still ended on its own terms, so it is traceable.
+# Anything else lacking eos was cut short by the engine.
+_COMPLETE_WITHOUT_EOS_REASONS = {"length", "max_tokens", "parse_error"}
+
+
+def _response_output_ids(resp: dict, fmt: str) -> Optional[list]:
+    """Pull ``output_ids`` out of a parsed response, whatever its wire
+    format."""
+    if fmt == FMT_ANTHROPIC:
+        return resp.get("output_ids")
+    choices = resp.get("choices")
+    if not choices:
+        return None
+    return choices[0].get("output_ids")
+
+
+def _response_finish_reason(resp: dict, fmt: str) -> Optional[str]:
+    """Pull the terminal reason out of a parsed response, whatever its wire
+    format."""
+    if fmt == FMT_ANTHROPIC:
+        return resp.get("stop_reason")
+    choices = resp.get("choices")
+    if not choices:
+        return None
+    return choices[0].get("finish_reason")
+
+
+def _response_routed_experts(resp: dict, fmt: str) -> Any:
+    """Pull ``routed_experts`` out of a parsed response, whatever its wire
+    format."""
+    if fmt == FMT_ANTHROPIC:
+        return resp.get("routed_experts")
+    choices = resp.get("choices")
+    if not choices:
+        return None
+    return choices[0].get("routed_experts")
+
 
 def _detect_format(req_path: str) -> str:
     if req_path.endswith("/messages") or "/v1/messages" in req_path:
@@ -249,6 +289,9 @@ class SessionServer:
         port (int): Port for this session server to listen on.
         request_timeout (float): Total timeout in seconds for forwarding requests to the worker.
         read_bufsize (int): Buffer limit for line reader in ClientSession. Default is 64MB (2**26).
+        reject_truncated_response (bool): When True, an assistant turn whose ``output_ids`` do not end with the
+            eos token is not traced and the caller gets a 500 instead of the partial content. Defaults to False,
+            which keeps the legacy pass-through behaviour.
     """
 
     def __init__(
@@ -260,6 +303,7 @@ class SessionServer:
         request_timeout: float = 1200.0,
         read_bufsize: int = 2**26,
         enable_return_routed_experts: bool = False,
+        reject_truncated_response: bool = False,
     ):
         self.worker_base_url = worker_base_url.rstrip("/")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
@@ -268,8 +312,15 @@ class SessionServer:
         self.request_timeout = request_timeout
         self.read_bufsize = read_bufsize
         self.enable_return_routed_experts = enable_return_routed_experts
+        self.reject_truncated_response = reject_truncated_response
         self.store = get_store()
         self.stop_word = self.tokenizer.eos_token or ""
+        self.eos_token_id = self.tokenizer.eos_token_id
+        if reject_truncated_response and self.eos_token_id is None:
+            raise ValueError(
+                "reject_truncated_response requires a tokenizer with eos_token_id; "
+                f"{tokenizer_path!r} does not define one."
+            )
 
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
@@ -376,6 +427,33 @@ class SessionServer:
             worker_req["messages"] = []
 
         return worker_req
+
+    def is_truncated_turn(self, resp: dict, fmt: str) -> bool:
+        """Whether a parsed upstream response carries an interrupted assistant
+        turn.
+
+        An interrupted turn is one the engine stopped serving mid-generation — an abort, or a stream that died
+        before its terminator. Hitting ``max_tokens`` is *not* interrupted: the turn is short by request, the
+        caller asked for exactly that, and tracing it is correct.
+
+        ``include_stop_str_in_output`` is always forced on for traced requests, so lmdeploy appends the eos token
+        only when the turn ended on its own. A missing trailing eos therefore flags every early stop, and the
+        ``finish_reason`` tells the legitimate ones apart. Checking eos as well as the reason matters because the
+        Anthropic endpoint flattens aborts into ``stop_reason="stop_sequence"``.
+
+        Args:
+            resp (dict): The parsed upstream response, still in ``fmt`` shape.
+            fmt (str): The request format that produced this response.
+
+        Returns:
+            bool: True when the turn was cut short and must not be traced.
+        """
+        output_ids = _response_output_ids(resp, fmt)
+        if not output_ids:
+            return True
+        if output_ids[-1] == self.eos_token_id:
+            return False
+        return _response_finish_reason(resp, fmt) not in _COMPLETE_WITHOUT_EOS_REASONS
 
     async def on_response(self, worker_resp: dict, fmt: str, orig_req_body: dict) -> dict:
         """Trace the assistant turn into ``trace_store`` (always in OpenAI
@@ -707,10 +785,20 @@ class SessionServer:
                     response_data = None
 
             if response_data is not None:
-                try:
-                    await self.on_response(response_data, fmt, orig_req_body)
-                except Exception as exc:
-                    session_error_msg = f"SessionServer response hook failed: {type(exc).__name__}: {exc}"
+                if self.reject_truncated_response and self.is_truncated_turn(response_data, fmt):
+                    # Experts became ours when the worker answered; drain them even though the turn is discarded.
+                    await self._discard_routed_experts(response_data, fmt)
+                    output_ids = _response_output_ids(response_data, fmt) or []
+                    session_error_msg = (
+                        "SessionServer rejected a truncated assistant turn "
+                        f"(output_ids={len(output_ids)}, no trailing eos); it was not traced."
+                    )
+                    skip_done = True
+                else:
+                    try:
+                        await self.on_response(response_data, fmt, orig_req_body)
+                    except Exception as exc:
+                        session_error_msg = f"SessionServer response hook failed: {type(exc).__name__}: {exc}"
 
         if session_error_msg:
             get_logger().error(session_error_msg)
@@ -735,6 +823,16 @@ class SessionServer:
             return web.json_response(_error_payload(fmt, session_error_msg), status=500)
 
         return response
+
+    async def _discard_routed_experts(self, resp: dict, fmt: str) -> None:
+        raw = _response_routed_experts(resp, fmt)
+        if raw is None:
+            return
+        try:
+            # Decoding a shared-store key pops it, which is the only way to release it.
+            await self._decode_routed_experts(raw)
+        except Exception:
+            get_logger().exception("SessionServer failed to release routed experts of a discarded turn.")
 
     async def _decode_routed_experts(self, routed_experts: Any) -> np.ndarray:
         if isinstance(routed_experts, str):
@@ -1044,6 +1142,7 @@ class SessionServerActor:
         port: int,
         request_timeout: float,
         enable_return_routed_experts: bool = False,
+        reject_truncated_response: bool = False,
     ):
         self.worker_base_url = worker_base_url
         self.tokenizer_path = tokenizer_path
@@ -1051,6 +1150,7 @@ class SessionServerActor:
         self.port = port
         self.request_timeout = request_timeout
         self.enable_return_routed_experts = enable_return_routed_experts
+        self.reject_truncated_response = reject_truncated_response
         self.server: SessionServer | None = None
 
     @property
@@ -1068,6 +1168,7 @@ class SessionServerActor:
             port=self.port,
             request_timeout=self.request_timeout,
             enable_return_routed_experts=self.enable_return_routed_experts,
+            reject_truncated_response=self.reject_truncated_response,
         )
         await self.server.start()
         return self.server.url
