@@ -201,6 +201,10 @@ class AsyncProduceStrategyConfig(ProduceStrategyConfig):
             before the producer stops. Defaults to 0.0.
         enable_partial_rollout (bool): Whether unfinished rollouts can be
             continued after a weight sync. Defaults to False.
+        enable_session_carryover (bool): Whether sandbox agents survive a weight sync. Their next LLM request parks
+            at the SessionServer gate instead of being aborted, and the unfinished rollout task is kept across
+            ``produce_batch`` calls, so one trajectory can span several weight versions. Requires
+            ``max_staleness >= 1``. Defaults to False.
         max_staleness (int): Maximum allowed model-step staleness for replayed
             samples. Defaults to 0.
         max_token_staleness (int | None): Maximum extra weight-sync periods a
@@ -230,6 +234,7 @@ class AsyncProduceStrategyConfig(ProduceStrategyConfig):
 
     over_sample_threshold: float = 0.0
     enable_partial_rollout: bool = False
+    enable_session_carryover: bool = False
     max_staleness: int = Field(default=0, ge=0)
     max_token_staleness: int | None = Field(default=None, ge=0)
     tail_batch_trigger_size: int = Field(default=-1, ge=-1)
@@ -250,13 +255,20 @@ class AsyncProduceStrategyConfig(ProduceStrategyConfig):
                 "Token-expired groups will be terminally discarded because tail_batch_trigger_size=-1 disables "
                 "rerollout."
             )
+        if self.enable_session_carryover and self.max_staleness < 1:
+            raise ValueError(
+                "enable_session_carryover requires max_staleness >= 1; otherwise every carried-over trajectory "
+                "expires on the next step and the feature has no effect."
+            )
         if rollout_controller is not None:
             import ray
 
             ray.get(rollout_controller.set_enable_partial_rollout.remote(self.enable_partial_rollout))
+            ray.get(rollout_controller.set_enable_session_carryover.remote(self.enable_session_carryover))
         return AsyncProduceStrategy(
             over_sample_threshold=self.over_sample_threshold,
             enable_partial_rollout=self.enable_partial_rollout,
+            enable_session_carryover=self.enable_session_carryover,
             max_staleness=self.max_staleness,
             max_token_staleness=self.max_token_staleness,
             sync_weights_interval=sync_weights_interval,
@@ -343,6 +355,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         sync_weights_interval: int,
         is_valid_sample_fn: IsValidSampleFn,
         should_continue_fn: ShouldContinueFn,
+        enable_session_carryover: bool = False,
     ):
         super().__init__(is_valid_sample_fn, should_continue_fn)
 
@@ -360,6 +373,7 @@ class AsyncProduceStrategy(ProduceStrategy):
 
         self.over_sample_threshold = over_sample_threshold
         self.enable_partial_rollout = enable_partial_rollout
+        self.enable_session_carryover = enable_session_carryover
         self.max_staleness = max_staleness
         self.stale_threshold = calculate_stale_threshold(max_staleness, sync_weights_interval)
         self.token_stale_threshold = (

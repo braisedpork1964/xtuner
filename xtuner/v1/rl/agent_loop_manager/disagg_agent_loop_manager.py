@@ -282,7 +282,7 @@ class DisaggAgentLoopManager:
     async def continue_produce(self, model_step: int) -> None:
         # 与 pause_produce 成对：同步/评测完成后，用新 model_step 恢复后台 producer。
         self._model_step = model_step
-        await self._rollout_controller.continue_generation.remote()  # type: ignore[attr-defined]
+        await self._rollout_controller.continue_generation.remote(model_step=model_step)  # type: ignore[attr-defined]
         self._status = AgentLoopManagerStatus.NORMAL
         self._update_event.clear()
 

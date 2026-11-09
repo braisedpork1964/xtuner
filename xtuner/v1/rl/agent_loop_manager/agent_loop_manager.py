@@ -221,7 +221,7 @@ class AgentLoopManager:
         active_tasks = [task for task in self.task_runners if current_sizes[task.task_name] > 0]
         assert active_tasks, "No active tasks found"
 
-        await self._rollout_controller.continue_generation.remote()  # type: ignore[attr-defined]
+        await self._rollout_controller.continue_generation.remote(model_step=model_step)  # type: ignore[attr-defined]
         local_progress = ProduceProgress.build(
             task_names=self.task_names,
             target_samples=current_sizes,

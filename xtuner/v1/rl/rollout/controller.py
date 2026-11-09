@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Any, TypeAlias
 from uuid import uuid4
 
@@ -65,6 +66,8 @@ class RolloutController:
             worker_lifecycle_listeners=[self.proxy_manager] if self.proxy_manager is not None else None,
         )
         self.health_manager.start()
+        # Set by AsyncProduceStrategyConfig.build(); see pause_generation / continue_generation.
+        self.enable_session_carryover = False
 
     def get_weight_update_targets(self) -> tuple[RolloutWeightUpdateTarget, ...]:
         """Return rollout endpoints that can receive weight update requests."""
@@ -131,7 +134,7 @@ class RolloutController:
             ]
         )
 
-    def pause_generation(self):
+    def _pause_generation_by_abort(self):
         self.health_manager.pause()
         active_workers = self.registry.active_workers()
         futures = [
@@ -152,6 +155,56 @@ class RolloutController:
         if failed_worker_urls:
             self.logger.warning(f"Abort request failed: worker_urls={failed_worker_urls}")
 
+    async def _pause_generation_by_gate(self) -> dict:
+        """Close every gate, wait for in-flight turns, and abort only the
+        workers that did not drain."""
+        self.health_manager.pause()
+        start = time.perf_counter()
+        active_workers = self.registry.active_workers()
+        entrypoints = [worker for worker in active_workers if worker.is_request_entrypoint]
+
+        await asyncio.gather(
+            *(worker.actor.hold_session_server.remote() for worker in entrypoints)  # type: ignore[attr-defined]
+        )
+        timeout_s = self.config.session_drain_timeout_s
+        remaining = await asyncio.gather(
+            *(worker.actor.drain_session_server.remote(timeout_s) for worker in entrypoints)  # type: ignore[attr-defined]
+        )
+
+        stuck = [worker for worker, count in zip(entrypoints, remaining) if count]
+        aborted_inflight = sum(remaining)
+        if stuck:
+            self.logger.warning(
+                f"SessionServer drain timed out after {timeout_s}s; aborting {aborted_inflight} in-flight "
+                f"request(s) on worker_urls={[worker.url for worker in stuck]}"
+            )
+            await asyncio.gather(
+                *(worker.actor.pause_generation.remote() for worker in stuck)  # type: ignore[attr-defined]
+            )
+        # Non-entrypoint workers never serve proxied traffic, so they only need the abort flag.
+        for worker in active_workers:
+            if not worker.is_request_entrypoint:
+                await worker.actor.pause_generation.remote()  # type: ignore[attr-defined]
+
+        drain_time_s = time.perf_counter() - start
+        self.logger.info(
+            f"SessionServer gates held: workers={len(entrypoints)}, drain_time_s={drain_time_s:.2f}, "
+            f"aborted_inflight={aborted_inflight}"
+        )
+        return {"drain_time_s": drain_time_s, "aborted_inflight": aborted_inflight}
+
+    def set_enable_session_carryover(self, enable: bool) -> None:
+        """Switch pause_generation between aborting generation and parking it
+        at the SessionServer gate."""
+        self.enable_session_carryover = enable
+        self.logger.info(f"RolloutController session carryover set to {enable}.")
+
+    async def pause_generation(self):
+        if self.enable_session_carryover:
+            return await self._pause_generation_by_gate()
+        self._pause_generation_by_abort()
+        return None
+
     async def check_and_shutdown_inactive_workers(self):
         """Run a fail-fast health barrier and shut down failed groups so
         training can reuse shared rollout resources."""
@@ -161,8 +214,22 @@ class RolloutController:
         """Restart inactive groups before a sync-step weight update."""
         await asyncio.to_thread(self.health_manager.restart_inactive_workers)
 
-    def continue_generation(self):
+    async def continue_generation(self, model_step: int | None = None):
+        """Resume generation. With carryover on, this also opens the gates for
+        the now-loaded weights.
+
+        Args:
+            model_step (int | None): Weight version the workers now serve.
+        """
         self._broadcast_to_active_workers("continue_generation")
+        if self.enable_session_carryover:
+            entrypoints = [worker for worker in self.registry.active_workers() if worker.is_request_entrypoint]
+            await asyncio.gather(
+                *(
+                    worker.actor.release_session_server.remote(model_step)  # type: ignore[attr-defined]
+                    for worker in entrypoints
+                )
+            )
         self.health_manager.resume()
 
     def offload(self):

@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 from functools import reduce
@@ -327,6 +328,15 @@ class SessionServer:
         self._site: Optional[web.TCPSite] = None
         self._lmdeploy_actor: Optional[ray.actor.ActorHandle] = None
 
+        # Gate: closed between the moment a rollout step stops accepting work and the moment the next set of
+        # weights is loaded. Requests park here instead of reaching a worker that is offloaded or mid-update.
+        self._gate = asyncio.Event()
+        self._gate.set()
+        self._inflight = 0
+        self._drained = asyncio.Event()
+        self._drained.set()
+        self._model_step: Optional[int] = None
+
     async def on_request(self, req_body: dict, fmt: str, *, trace_enabled: bool = True) -> dict:
         """Normalize the request to drive the prefix cache + inject extension
         fields.
@@ -427,6 +437,39 @@ class SessionServer:
             worker_req["messages"] = []
 
         return worker_req
+
+    def hold(self) -> None:
+        """Stop letting new requests through to the worker.
+
+        Idempotent.
+        """
+        self._gate.clear()
+
+    def release(self, model_step: Optional[int] = None) -> None:
+        """Let parked requests through again, tagging them with the now-loaded
+        weight version.
+
+        Args:
+            model_step (Optional[int]): Weight version the worker now serves. ``None`` leaves it unchanged.
+        """
+        if model_step is not None:
+            self._model_step = model_step
+        self._gate.set()
+
+    async def wait_drained(self, timeout_s: float) -> int:
+        """Wait until no request is executing on the worker.
+
+        Args:
+            timeout_s (float): How long to wait before giving up.
+
+        Returns:
+            int: Requests still executing; 0 when fully drained.
+        """
+        try:
+            await asyncio.wait_for(self._drained.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            pass
+        return self._inflight
 
     def is_truncated_turn(self, resp: dict, fmt: str) -> bool:
         """Whether a parsed upstream response carries an interrupted assistant
@@ -608,6 +651,26 @@ class SessionServer:
         get_logger().info("SessionServer stopped.")
 
     async def _handle_request(self, request: web.Request) -> web.Response:
+        """Park the request while the gate is closed, then proxy it."""
+        await self._gate.wait()
+        transport = request.transport
+        if transport is None or transport.is_closing():
+            # The agent gave up while parked and its client already retried; generating now would be wasted work
+            # and would race the retry over the same trace key.
+            return web.json_response(
+                _error_payload(_detect_format(request.match_info["path"]), "Client disconnected while paused."),
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        self._inflight += 1
+        self._drained.clear()
+        try:
+            return await self._proxy_request(request)
+        finally:
+            self._inflight -= 1
+            if self._inflight == 0:
+                self._drained.set()
+
+    async def _proxy_request(self, request: web.Request) -> web.Response:
         """Proxy handler: detect format, run hooks, forward, stream back."""
 
         req_path = request.match_info["path"]
@@ -1177,3 +1240,22 @@ class SessionServerActor:
         if self.server is not None:
             await self.server.stop()
             self.server = None
+
+    async def hold(self) -> None:
+        """Close the gate so new requests park instead of reaching the
+        worker."""
+        if self.server is not None:
+            self.server.hold()
+
+    async def release(self, model_step: int | None = None) -> None:
+        """Open the gate and record the weight version the worker now
+        serves."""
+        if self.server is not None:
+            self.server.release(model_step)
+
+    async def wait_drained(self, timeout_s: float) -> int:
+        """Wait for in-flight requests to finish; returns how many are still
+        running."""
+        if self.server is None:
+            return 0
+        return await self.server.wait_drained(timeout_s)

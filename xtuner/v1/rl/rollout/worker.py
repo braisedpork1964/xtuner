@@ -122,6 +122,10 @@ class RolloutConfig(BaseModel):
             workers. Defaults to 1200.0.
         reject_truncated_response (bool): Whether SessionServer rejects assistant turns whose ``output_ids`` lack a
             trailing eos token, instead of tracing the partial text. Defaults to False.
+        session_drain_timeout_s (float): How long ``pause_generation`` waits for in-flight proxied turns to finish
+            before aborting them. Only used when session carryover is enabled. Aborting costs the tokens that turn
+            already generated, so this is set generously; lower it once a single turn's p99 is known.
+            Defaults to 300.0.
         context_length (int): Context length for the rollout worker.
         launch_server_method (Literal["ray", "multiprocessing"]): Server launch method. Defaults to "ray".
         system_prompt (Optional[str]): System prompt to guide generation behavior. Defaults to None.
@@ -304,6 +308,13 @@ class RolloutConfig(BaseModel):
             help="Reject assistant turns whose output_ids lack a trailing eos instead of tracing the partial text.",
         ),
     ] = False
+    session_drain_timeout_s: Annotated[
+        float,
+        Parameter(
+            group=infer_group,
+            help="How long pause_generation waits for in-flight proxied turns before aborting them.",
+        ),
+    ] = 300.0
     context_length: Annotated[
         Optional[int],
         Parameter(
@@ -741,6 +752,32 @@ class RolloutWorker(SingleAcceleratorWorker):
         """Pause the worker's generation process."""
         self.receive_abort_request.set()
         return await self._send_abort_request()
+
+    async def hold_session_server(self) -> None:
+        """Close this worker's SessionServer gate; proxied requests park
+        instead of reaching the engine."""
+        self.receive_abort_request.set()
+        if self.session_server_actor is not None:
+            await self.session_server_actor.hold.remote()
+
+    async def drain_session_server(self, timeout_s: float) -> int:
+        """Wait for proxied requests still executing on the engine.
+
+        Args:
+            timeout_s (float): How long to wait before giving up.
+
+        Returns:
+            int: Requests still executing; 0 when fully drained.
+        """
+        if self.session_server_actor is None:
+            return 0
+        return await self.session_server_actor.wait_drained.remote(timeout_s)
+
+    async def release_session_server(self, model_step: int | None = None) -> None:
+        """Open this worker's SessionServer gate for the given weight
+        version."""
+        if self.session_server_actor is not None:
+            await self.session_server_actor.release.remote(model_step)
 
     async def _send_abort_request(self) -> bool:
         url = f"{self.server_url}/abort_request"
