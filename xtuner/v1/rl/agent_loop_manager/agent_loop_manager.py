@@ -209,6 +209,7 @@ class AgentLoopManager:
         train_step: int,
         *,
         model_step: int,
+        drain_pending: bool = True,
     ) -> ProduceBatchResult:
         # 共卡同步入口：生产入 buffer -> pause/drain 本轮 pending -> 取非空训练 batch。
         if batch_size <= 0:
@@ -280,7 +281,8 @@ class AgentLoopManager:
                     stale_threshold=task.stale_threshold,
                     token_stale_threshold=task.token_stale_threshold,
                     expired_groups_retryable=task.expired_groups_retryable,
-                )
+                ),
+                drain_pending=drain_pending,
             )
         result = await take_train_batch(
             task_runners=self.task_runners,
@@ -292,6 +294,12 @@ class AgentLoopManager:
             current_train_step=train_step,
             pause_time_s=pause_time_s,
         )
+        for task in active_tasks:
+            consume = getattr(task.produce_strategy, "consume_carried_counts", None)
+            if consume is not None:
+                carried, cancelled = consume()
+                result.inflight_carried += carried
+                result.carried_expired_cancelled += cancelled
         assert result.rollout_states, (
             "AgentLoopManager.produce_batch() must return non-empty rollout_states for colocated training. "
             "Use get_batch() for disaggregated empty/expired reads."
@@ -299,7 +307,9 @@ class AgentLoopManager:
 
         self.logger.info(
             f"[AgentLoopManager][{self.name}] produce_batch done "
-            f"elapsed={time.perf_counter() - start:.3f}, completed_groups={len(result.rollout_states)}"
+            f"elapsed={time.perf_counter() - start:.3f}, completed_groups={len(result.rollout_states)}, "
+            f"inflight_carried={result.inflight_carried}, "
+            f"carried_expired_cancelled={result.carried_expired_cancelled}"
         )
         return result
 
@@ -315,9 +325,15 @@ class AgentLoopManager:
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         pending_task_counts = get_pending_task_counts(self.task_runners)
         if pending_task_counts:
-            raise RuntimeError(
-                "Cannot save AgentLoopManager while pending rollout tasks still exist: "
-                f"{pending_task_counts}. Finish the current produce_batch before saving."
+            if not no_save_replay_buffer:
+                raise RuntimeError(
+                    "Cannot save AgentLoopManager while pending rollout tasks still exist: "
+                    f"{pending_task_counts}. Finish the current produce_batch before saving."
+                )
+            # Pending work is in-memory only, exactly like the replay buffer we are told to skip, so losing it on
+            # resume matches what this checkpoint already promises.
+            self.logger.warning(
+                f"Saving with pending rollout tasks that will be lost on resume: {pending_task_counts}"
             )
         for task in self.task_runners:
             checkpoint_dir = task_checkpoint_path(checkpoint_path, task.task_name)

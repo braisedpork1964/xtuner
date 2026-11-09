@@ -328,12 +328,15 @@ class RolloutTraceStore:
     def release(self, session_id: str, key: str | None = None):
         """Release Trie nodes and free associated resources for a session.
 
+        Releasing an unknown session is a no-op, so callers may release the same batch twice.
+
         Args:
             session_id (str): The session identifier.
             key (str | None): If None, release the whole session Trie and drop the session. Otherwise release only
                 the node at ``key`` (used by the SessionServer to drop an orphaned placeholder), keeping the session.
         """
-        assert session_id in self.sessions, f"Session ID '{session_id}' not found for release."
+        if session_id not in self.sessions:
+            return
         trie = self.sessions.pop(session_id) if key is None else self.sessions[session_id]
         trie.release(key)
 

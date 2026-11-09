@@ -89,6 +89,19 @@ def _agent_loop_manager_requires_rollout_proxy(
     return any(bool(getattr(task.agent_loop_config, "requires_rollout_proxy", False)) for task in task_cfgs)
 
 
+def _agent_loop_manager_uses_session_carryover(
+    cfg: AgentLoopManagerConfig | DisaggAgentLoopManagerConfig | None,
+) -> bool:
+    # Same hardcoded-adapter caveat as _agent_loop_manager_requires_rollout_proxy.
+    if cfg is None:
+        return False
+    tasks = getattr(cfg, "tasks", None)
+    if tasks is None:
+        return False
+    task_cfgs = tasks if isinstance(tasks, list) else [tasks]
+    return any(bool(getattr(task.produce_strategy_config, "enable_session_carryover", False)) for task in task_cfgs)
+
+
 def _trainer_config_requires_rollout_proxy(cfg: "BaseRLTrainerConfig") -> bool:
     return _agent_loop_manager_requires_rollout_proxy(
         cfg.agent_loop_manager_cfg
@@ -663,6 +676,7 @@ class BaseRLTrainer:
         self._seed = cfg.seed
         self.train_batch_size = cfg.train_batch_size
         self._sync_weights_interval = cfg.sync_weights_interval
+        self._enable_session_carryover = _agent_loop_manager_uses_session_carryover(cfg.agent_loop_manager_cfg)
         if XTUNER_DETERMINISTIC:
             set_deterministic()
         set_random_seed(cfg.seed)
@@ -859,6 +873,7 @@ class BaseRLTrainer:
             self.tokenizer.save_pretrained(str(save_hf_path))
 
     async def _run_initial_evaluate(self) -> None:
+        eval_batch: list[list[RolloutState]] = []
         try:
             eval_produce_result = await self.eval_agent_loop_manager.produce_batch(
                 self.evaluator.eval_batch_size,
@@ -880,13 +895,26 @@ class BaseRLTrainer:
             tb_scores = {f"eval/{k}": v for k, v in eval_metrics.items()}
             self._exp_tracker.add_scalars(tag_scalar_dict=tb_scores, global_step=0)
         finally:
-            self._release_trace_store()
+            self._release_trace_store(eval_batch)
 
-    def _release_trace_store(self) -> None:
+    def _release_trace_store(self, rollout_states: list[list[RolloutState]] | None = None) -> None:
         from xtuner.v1.rl.rollout.trace_store import get_existing_store
 
         store = get_existing_store()
         if store is None:
+            return
+
+        if self._enable_session_carryover and rollout_states is not None:
+            # Carried-over sessions must keep their trie across the weight sync, so only drop what was consumed.
+            session_ids = {
+                str(session_id)
+                for group in rollout_states
+                for state in group
+                if (session_id := state.extra_fields.get("agent_session_id")) is not None
+            }
+            if session_ids:
+                ray.get([store.release.remote(session_id) for session_id in sorted(session_ids)])
+            self.logger.info(f"Released {len(session_ids)} consumed trace session(s)")
             return
 
         self.logger.info("Release all sessions and free associated resources")
@@ -949,7 +977,7 @@ class BaseRLTrainer:
                 rollout_idx=train_step,
             )
 
-        self._release_trace_store()
+        self._release_trace_store(train_batch)
 
         return {
             "data_info": data_info,
@@ -957,6 +985,7 @@ class BaseRLTrainer:
         }
 
     async def _run_evaluation(self, train_step: int) -> dict[str, float]:
+        eval_batch: list[list[RolloutState]] = []
         try:
             eval_produce_result = await self.eval_agent_loop_manager.produce_batch(
                 self.evaluator.eval_batch_size,
@@ -976,7 +1005,7 @@ class BaseRLTrainer:
             self.logger.info(f"Train step {train_step} eval trajectories saved to {eval_trajectory_path}")
             return eval_metrics
         finally:
-            self._release_trace_store()
+            self._release_trace_store(eval_batch)
 
     def _save_debug_rollout_batch(self, train_batch: list[list[RolloutState]], train_step: int) -> None:
         assert self._debug_rollout_dir is not None
@@ -1686,6 +1715,7 @@ class RLColocateTrainer(BaseRLTrainer):
                             self.train_batch_size,
                             train_step=train_step,
                             model_step=model_step,
+                            drain_pending=self._should_drain_pending(train_step),
                         )
                     )
                 if XTUNER_DETERMINISTIC:
@@ -1748,6 +1778,22 @@ class RLColocateTrainer(BaseRLTrainer):
 
             self._log_step(train_step, step_timer_dict, produce_result, train_log_info, eval_log_info)
             self._cur_step = train_step
+
+    def _should_drain_pending(self, train_step: int) -> bool:
+        """Whether this step must settle every pending rollout instead of
+        carrying it to the next step.
+
+        Carried-over work lives only in memory, so a step that persists the replay buffer has to drain first; when the
+        buffer is not persisted, pending tasks share its fate and may be carried. The final step always drains so no
+        sandbox is left running.
+        """
+        if not self._enable_session_carryover:
+            return True
+        if train_step >= self._total_train_steps:
+            return True
+        interval = self._checkpoint_interval
+        is_checkpoint_step = interval is not None and interval != -1 and train_step % interval == 0
+        return is_checkpoint_step and not self._checkpoint_no_save_replay_buffer
 
     def _get_colocate_rollout_model_step(self, train_step: int) -> int:
         previous_step = train_step - 1

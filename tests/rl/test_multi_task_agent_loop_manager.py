@@ -73,7 +73,7 @@ class _FakeProduceStrategy:
             if hasattr(ctx, disagg_only_name):
                 raise AssertionError(f"colocate ProduceContext should not expose {disagg_only_name}")
 
-    async def pause_produce(self, ctx) -> float:
+    async def pause_produce(self, ctx, *, drain_pending: bool = True) -> float:
         self.cleanup_call_count += 1
         self.cleanup_model_steps.append(ctx.model_step)
         self.cleanup_progresses.append(ctx.progress)
@@ -99,7 +99,7 @@ class _FakeTimedProduceStrategy:
                 raise AssertionError(f"colocate ProduceContext should not expose {disagg_only_name}")
         self.called_progresses.append(ctx.progress)
 
-    async def pause_produce(self, ctx) -> float:
+    async def pause_produce(self, ctx, *, drain_pending: bool = True) -> float:
         self.cleanup_call_count += 1
         self.cleanup_model_steps.append(ctx.model_step)
         self.cleanup_progresses.append(ctx.progress)
@@ -110,7 +110,7 @@ class _FailingProduceStrategy:
     async def produce_batch(self, ctx) -> None:
         raise RuntimeError("original produce failure")
 
-    async def pause_produce(self, ctx) -> float:
+    async def pause_produce(self, ctx, *, drain_pending: bool = True) -> float:
         raise RuntimeError("cleanup failure")
 
 
@@ -507,7 +507,7 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
                 events.append("fast_produce_done")
                 fast_done.set()
 
-            async def pause_produce(self, ctx) -> float:
+            async def pause_produce(self, ctx, *, drain_pending: bool = True) -> float:
                 test_case.assertIn("slow_produce_done", events)
                 events.append("fast_pause")
                 return 0.0
@@ -517,7 +517,7 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
                 await fast_done.wait()
                 events.append("slow_produce_done")
 
-            async def pause_produce(self, ctx) -> float:
+            async def pause_produce(self, ctx, *, drain_pending: bool = True) -> float:
                 test_case.assertIn("slow_produce_done", events)
                 events.append("slow_pause")
                 return 0.0

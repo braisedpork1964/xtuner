@@ -28,6 +28,7 @@ _LIGHTWEIGHT_TEST_FILES = {
     "test_rl_disaggregated_trainer.py",
     "test_rollout_config_dist_port_base_patch.py",
     "test_rollout_logic.py",
+    "test_session_carryover.py",
     "test_single_turn_agent_loop.py",
     "test_staleness_policy.py",
     "test_utils.py",

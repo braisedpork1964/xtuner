@@ -2,12 +2,12 @@ import asyncio
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from xtuner.v1.data_proto.rl_data import Status
-from xtuner.v1.rl.utils import create_task
+from xtuner.v1.rl.utils import cancel_and_drain, create_task
 from xtuner.v1.utils import get_logger
 
 from .produce_utils import (
@@ -290,7 +290,7 @@ class ProduceStrategy(ABC):
     @abstractmethod
     async def produce_batch(self, ctx: ProduceContext) -> None: ...
 
-    async def pause_produce(self, ctx: ProduceContext) -> float:
+    async def pause_produce(self, ctx: ProduceContext, *, drain_pending: bool = True) -> float:
         return 0.0
 
     def pending_task_count(self) -> int:
@@ -383,23 +383,65 @@ class AsyncProduceStrategy(ProduceStrategy):
         )
         self.tail_batch_trigger_size = tail_batch_trigger_size
         self._local_pending_tasks: set[asyncio.Task] = set()
+        self._task_start_step: dict[asyncio.Task, int] = {}
+        self._carried_expired_cancelled = 0
 
     def pending_task_count(self) -> int:
         return len(self._local_pending_tasks)
 
-    async def pause_produce(self, ctx: ProduceContext) -> float:
+    async def pause_produce(self, ctx: ProduceContext, *, drain_pending: bool = True) -> float:
+        if self.enable_session_carryover and not drain_pending:
+            return await self._carry_over_pending(ctx)
+        self._task_start_step.clear()
         return await pause_pending_tasks(
             pending_tasks=self._local_pending_tasks,
             ctx=ctx,
             put_claimed_task=lambda task: ctx.put_generated_group(task.result()),
         )
 
+    def consume_carried_counts(self) -> tuple[int, int]:
+        """Pending tasks kept for the next step, and tasks cancelled because
+        they would expire.
+
+        Returns:
+            tuple[int, int]: ``(inflight_carried, carried_expired_cancelled)``.
+        """
+        cancelled = self._carried_expired_cancelled
+        self._carried_expired_cancelled = 0
+        return len(self._local_pending_tasks), cancelled
+
+    async def _carry_over_pending(self, ctx: ProduceContext) -> float:
+        # Tasks whose sandbox survives the weight sync stay pending; the rest are settled or dropped now.
+        for task in [task for task in self._local_pending_tasks if task.done()]:
+            self._local_pending_tasks.discard(task)
+            self._task_start_step.pop(task, None)
+            await ctx.put_generated_group(task.result())
+
+        doomed = [task for task in self._local_pending_tasks if self._will_expire_next_step(ctx, task)]
+        for task in doomed:
+            self._local_pending_tasks.discard(task)
+            self._task_start_step.pop(task, None)
+        if doomed:
+            self._carried_expired_cancelled += len(doomed)
+            logger.info(f"Cancelling {len(doomed)} pending task(s) that would expire next step.")
+            await cancel_and_drain(cast(list[asyncio.Task | None], doomed))
+        return 0.0
+
+    def _will_expire_next_step(self, ctx: ProduceContext, task: asyncio.Task) -> bool:
+        start_step = self._task_start_step.get(task)
+        if start_step is None:
+            return False
+        # seq_staleness at the next put is (train_step + 1) - start_step - 1.
+        return ctx.train_step - start_step >= self.stale_threshold
+
     async def produce_batch(self, ctx: ProduceContext) -> None:
         if ctx.task_name not in ctx.progress.target_samples:
             raise KeyError(f"ProduceProgress.target_samples missing task_name={ctx.task_name!r}")
 
-        # 共卡 async 的 pending 只属于本次 produce_batch。
-        self._local_pending_tasks = set()
+        if not self.enable_session_carryover:
+            # 共卡 async 的 pending 只属于本次 produce_batch。
+            self._local_pending_tasks = set()
+            self._task_start_step.clear()
 
         if ctx.batch_target <= 0:
             return
@@ -426,12 +468,14 @@ class AsyncProduceStrategy(ProduceStrategy):
 
         async def spawn_one() -> asyncio.Task:
             rollout_state = await ctx.sample_group(from_expired_pool=sample_expired)
-            return create_task(
+            task = create_task(
                 ctx.generate_group(
                     rollout_state,
                     enable_partial_rollout=self.enable_partial_rollout,
                 )
             )
+            self._task_start_step[task] = ctx.model_step
+            return task
 
         initial_available = await ctx.completed_count()
         progress_displayer = _ProgressDisplayer.create(

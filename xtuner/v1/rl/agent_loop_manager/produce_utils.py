@@ -170,7 +170,7 @@ class BaseProduceContext:
         return result
 
     async def put_generated_group(self, group: list[RolloutState]) -> bool:
-        produced_tokens = sum(len(item.response_ids or []) - len(item.response_model_steps or []) for item in group)
+        produced_tokens = sum(produced_token_count(item, self.model_step) for item in group)
         initial_status = get_group_status(group)
         discard_status: Status | None = None
 
@@ -216,6 +216,27 @@ class BaseProduceContext:
         return final_status == Status.COMPLETED
 
 
+def produced_token_count(rollout_state: RolloutState, model_step: int) -> int:
+    """Response tokens this produce window generated.
+
+    Tokens already stamped with an earlier version belong to a previous window. An unstamped tail is counted too,
+    because ``update_sample_version`` only stamps it once the group reaches the replay buffer.
+
+    Args:
+        rollout_state (RolloutState): Sample whose response tokens are counted.
+        model_step (int): Weight version of the current produce window.
+
+    Returns:
+        int: Number of freshly generated response tokens.
+    """
+    response_len = len(rollout_state.response_ids or [])
+    model_steps = rollout_state.response_model_steps or []
+    if not model_steps:
+        return response_len
+    fresh = sum(1 for step in model_steps if step == model_step)
+    return fresh + max(0, response_len - len(model_steps))
+
+
 @dataclass
 class ProduceBatchResult:
     """Result of a single ``produce_batch`` call.
@@ -232,6 +253,8 @@ class ProduceBatchResult:
         leftover_completed (int): Number of completed groups remaining in the replay buffer after this batch.
         leftover_aborted (int): Number of aborted groups remaining in the replay buffer.
         leftover_expired (int): Number of expired groups remaining in the replay buffer.
+        inflight_carried (int): Number of rollout tasks kept pending for the next step by session carryover.
+        carried_expired_cancelled (int): Number of pending tasks cancelled because they would expire next step.
         failed_samples (int): Number of failed samples observed in the current produce window, including replay-buffer leftovers and samples discarded before insertion.
         filtered_samples (int): Number of filtered samples observed in the current produce window, including replay-buffer leftovers and samples discarded before insertion.
         raw_rewards_sum (float): Sum of rewards produced before replay-buffer insertion for the current window.
@@ -255,6 +278,9 @@ class ProduceBatchResult:
     leftover_completed: int = 0
     leftover_aborted: int = 0
     leftover_expired: int = 0
+    # Sandbox rollouts kept across produce_batch calls: neither in the replay buffer nor in any leftover_* count.
+    inflight_carried: int = 0
+    carried_expired_cancelled: int = 0
     # failed / filtered are produce-window sample counts, not pure buffer leftover snapshots
     failed_samples: int = 0
     filtered_samples: int = 0
