@@ -498,7 +498,9 @@ class SessionServer:
             return False
         return _response_finish_reason(resp, fmt) not in _COMPLETE_WITHOUT_EOS_REASONS
 
-    async def on_response(self, worker_resp: dict, fmt: str, orig_req_body: dict) -> dict:
+    async def on_response(
+        self, worker_resp: dict, fmt: str, orig_req_body: dict, model_step: Optional[int] = None
+    ) -> dict:
         """Trace the assistant turn into ``trace_store`` (always in OpenAI
         shape).
 
@@ -511,6 +513,8 @@ class SessionServer:
                 conversation for OpenAI-shape tracing because the wire body
                 forwarded to the worker no longer carries ``messages`` /
                 ``system`` / ``tools``.
+            model_step (Optional[int]): Weight version that generated this turn, as read when the request passed
+                the gate. Recorded per token so a trajectory spanning several versions stays attributable.
 
         Returns:
             dict: The (possibly trimmed) response — currently unused by the
@@ -617,6 +621,7 @@ class SessionServer:
                 labels=output_token_ids,
                 expert_key=response_expert,
                 length=len(output_token_ids),
+                model_step=model_step,
             ),
         )
 
@@ -663,14 +668,16 @@ class SessionServer:
             )
         self._inflight += 1
         self._drained.clear()
+        # Read the version here: it is the one the worker will actually serve this request with.
+        model_step = self._model_step
         try:
-            return await self._proxy_request(request)
+            return await self._proxy_request(request, model_step)
         finally:
             self._inflight -= 1
             if self._inflight == 0:
                 self._drained.set()
 
-    async def _proxy_request(self, request: web.Request) -> web.Response:
+    async def _proxy_request(self, request: web.Request, model_step: Optional[int] = None) -> web.Response:
         """Proxy handler: detect format, run hooks, forward, stream back."""
 
         req_path = request.match_info["path"]
@@ -859,7 +866,7 @@ class SessionServer:
                     skip_done = True
                 else:
                     try:
-                        await self.on_response(response_data, fmt, orig_req_body)
+                        await self.on_response(response_data, fmt, orig_req_body, model_step)
                     except Exception as exc:
                         session_error_msg = f"SessionServer response hook failed: {type(exc).__name__}: {exc}"
 

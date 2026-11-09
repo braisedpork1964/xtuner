@@ -103,6 +103,8 @@ class TokenizedSegment(BaseModel):
     logprobs: List[float] | None = Field(default=None, repr=False)
     expert_key: Any = Field(default=None, repr=False)
     length: int | None = None
+    # Weight version that generated these tokens; None for input segments and for untracked runs.
+    model_step: int | None = None
 
     def model_post_init(self, _):
         if self.labels is None:
@@ -351,10 +353,11 @@ class RolloutTraceStore:
             prompt_text (str): The complete assembled prompt string to look up.
 
         Returns:
-            dict: The trace dictionary containing `input_ids`, `labels`, `logprobs`,
-                and `routed_experts`. `routed_experts` is a per-node list of expert-id
-                refs for a MoE trace, or `None` when the trace carries no routed
-                experts at all (dense model).
+            dict: The trace dictionary containing `input_ids`, `labels`, `logprobs`, `model_steps`
+                and `routed_experts`. `model_steps` is per-token and aligned with `input_ids`, carrying the
+                weight version of each generated token (None where unknown). `routed_experts` is a per-node list
+                of expert-id refs for a MoE trace, or `None` when the trace carries no routed experts at all
+                (dense model).
 
         Raises:
             ValueError: If the prompt_text does not completely match the trace keys in the session.
@@ -384,7 +387,7 @@ class RolloutTraceStore:
                 f"prompt_len={len(prompt_text)} matched_len={len(key)} key_count={len(session_keys)}. "
                 "See the logged '[TraceStore] prompt mismatch' report for the full diff."
             )
-        trace: dict[str, Any] = {"input_ids": [], "labels": [], "logprobs": []}
+        trace: dict[str, Any] = {"input_ids": [], "labels": [], "logprobs": [], "model_steps": []}
         expert_keys: list[Any] = []
         for node in nodes:
             node_val = node.value
@@ -395,6 +398,7 @@ class RolloutTraceStore:
             trace["input_ids"].extend(node_val.token_ids)
             trace["labels"].extend(node_val.labels)
             trace["logprobs"].extend(node_val.logprobs)
+            trace["model_steps"].extend([node_val.model_step] * len(node_val.token_ids))
             expert_keys.append(node_val.expert_key)
         trace["routed_experts"] = _resolve_routed_experts(expert_keys, session_id)
         return trace

@@ -169,6 +169,22 @@ def _count_tool_turns(messages: list[dict[str, Any]]) -> int:
     )
 
 
+def _response_model_steps(data: dict[str, Any]) -> list[int] | None:
+    """Per-token weight versions for the response tokens, aligned with
+    ``response_ids``.
+
+    Returns None when any turn lacks a version, so staleness falls back to the completion-time stamp applied by
+    ``replay_buffer.put``.
+    """
+    model_steps = data.get("model_steps")
+    if not model_steps:
+        return None
+    response_steps = [model_step for model_step, label in zip(model_steps[1:], data["labels"][1:]) if label != -100]
+    if not response_steps or any(model_step is None for model_step in response_steps):
+        return None
+    return response_steps
+
+
 def _extract_reward_payload(item: AgentRolloutItem) -> dict[str, Any] | None:
     for record in item.judgers.values():
         reward = record.metadata.get("reward")
@@ -336,6 +352,7 @@ class AgentInSandboxLoop(AgentLoop):
             segment_state.response_ids = [
                 token_id for token_id, label in zip(data["input_ids"][1:], data["labels"][1:]) if label != -100
             ]
+            segment_state.response_model_steps = _response_model_steps(data)
             segment_state.logprobs = data["logprobs"]
             # ``routed_experts`` is a per-node list for a MoE trace or ``None`` for a dense one; trace_store's
             # ``_resolve_routed_experts`` already enforces the all-or-nothing invariant (a trace mixing MoE turns with
